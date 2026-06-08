@@ -32,6 +32,7 @@ param(
     [string] $ApiKey,
     [string] $Model = "anthropic/claude-haiku-4.5",
     [int]    $MaxDocUpdates = 5,
+    [int]    $LookbackDays  = 3,
     [switch] $WhatIf
 )
 
@@ -138,7 +139,7 @@ if (-not (Test-Path -LiteralPath $VaultPath)) {
 }
 
 # =============================================================================
-# STEP 1 -- Find today's individual session files
+# STEPS 1-3 -- Find, merge, and write session files (N-day lookback)
 # =============================================================================
 
 $SessionsDir = Join-Path $VaultPath "sessions"
@@ -148,74 +149,111 @@ if (-not (Test-Path -LiteralPath $SessionsDir)) {
     exit 0
 }
 
-# Individual session files: YYYY-MM-DD-SomeName.md  (date + hyphen + title)
-# Exclude: YYYY-MM-DD.md (already-consolidated daily files) and All-Sessions.md
-$todayFiles = Get-ChildItem -LiteralPath $SessionsDir -Filter "*.md" -File |
-    Where-Object { $_.Name -match "^$Today-.+\.md$" } |
-    Sort-Object Name
+$allSessionBodies   = [System.Collections.Generic.List[string]]::new()
+$consolidatedDates  = [System.Collections.Generic.List[string]]::new()
+$totalSessionsFound = 0
 
-if ($todayFiles.Count -eq 0) {
-    Write-Log "No individual session files found for $Today -- nothing to consolidate."
-    Write-Log "===== Session Consolidator finished ====="
-    exit 0
-}
+for ($daysBack = 0; $daysBack -le $LookbackDays; $daysBack++) {
+    $targetDate = (Get-Date).AddDays(-$daysBack).ToString("yyyy-MM-dd")
 
-Write-Log "Found $($todayFiles.Count) session file(s) for $Today."
+    # Per-session files: YYYY-MM-DD-SomeName.md (date-prefix + hyphen + title)
+    # Bare YYYY-MM-DD.md consolidated daily files are excluded by requiring -.+
+    $dateFiles = Get-ChildItem -LiteralPath $SessionsDir -Filter "*.md" -File |
+        Where-Object { $_.Name -match "^$targetDate-.+\.md$" } |
+        Sort-Object Name
 
-# =============================================================================
-# STEP 2 -- Read and merge sessions
-# =============================================================================
+    if ($dateFiles.Count -eq 0) { continue }
 
-$sessionParts = foreach ($file in $todayFiles) {
-    $raw   = Read-TextFile $file.FullName
-    # Strip YAML frontmatter block (anchored to start of file)
-    $body  = $raw -replace '(?s)\A---\r?\n.*?\r?\n---\r?\n', ''
-    $title = $file.BaseName -replace "^$Today-", '' -replace '-', ' '
-    "### $title`n`n$($body.Trim())"
-}
+    Write-Log "Found $($dateFiles.Count) session file(s) for $targetDate."
+    $totalSessionsFound += $dateFiles.Count
 
-$combinedBody = $sessionParts -join "`n`n---`n`n"
+    $sessionParts = foreach ($file in $dateFiles) {
+        $raw   = Read-TextFile $file.FullName
+        $body  = $raw -replace '(?s)\A---\r?\n.*?\r?\n---\r?\n', ''
+        $title = $file.BaseName -replace "^$targetDate-", '' -replace '-', ' '
+        "### $title`n`n$($body.Trim())"
+    }
+    $dateCombinedBody = $sessionParts -join "`n`n---`n`n"
+    $allSessionBodies.Add($dateCombinedBody)
 
-$consolidatedContent = @"
+    $consolidatedPath = Join-Path $SessionsDir "$targetDate.md"
+    $consolidatedRel  = "sessions\$targetDate.md"
+
+    if (Test-Path -LiteralPath $consolidatedPath) {
+        if ($WhatIf) {
+            Write-Log "WHATIF: Would append $($dateFiles.Count) session(s) to existing $consolidatedRel"
+        } else {
+            $existing = Read-TextFile $consolidatedPath
+            $appended = $existing.TrimEnd() + "`n`n---`n`n" + $dateCombinedBody
+            Write-TextFile $consolidatedPath $appended
+            Write-Log "Appended $($dateFiles.Count) session(s) to existing: $consolidatedRel"
+        }
+    } else {
+        $newContent = @"
 ---
-date: "$Today"
+date: "$targetDate"
 type: "daily-session"
 tags: ["session", "daily-log", "category/sessions"]
 ---
 
 #session #daily-log #category/sessions
 
-# Session Log -- $Today
+# Session Log -- $targetDate
 
-$combinedBody
+$dateCombinedBody
 
 ## Related Topics
 
 - [[All-Sessions]]
 "@
+        if ($WhatIf) {
+            Write-Log "WHATIF: Would write $consolidatedRel"
+        } else {
+            Write-TextFile $consolidatedPath $newContent
+            Write-Log "Wrote: $consolidatedRel"
+        }
+    }
 
-# =============================================================================
-# STEP 3 -- Write consolidated file, delete individual files
-# =============================================================================
-
-$consolidatedPath = Join-Path $SessionsDir "$Today.md"
-$consolidatedRel  = "sessions\$Today.md"
-
-if ($WhatIf) {
-    Write-Log "WHATIF: Would write $consolidatedRel"
-} else {
-    Write-TextFile $consolidatedPath $consolidatedContent
-    Write-Log "Wrote: $consolidatedRel"
+    foreach ($file in $dateFiles) {
+        $rel = $file.FullName.Substring($VaultPath.Length).TrimStart('\', '/')
+        if ($WhatIf) {
+            Write-Log "WHATIF: Would delete $rel"
+        } else {
+            Remove-Item -LiteralPath $file.FullName -Force
+            Write-Log "Deleted: $rel"
+        }
+    }
+    $consolidatedDates.Add($targetDate)
 }
 
-foreach ($file in $todayFiles) {
-    $rel = $file.FullName.Substring($VaultPath.Length).TrimStart('\', '/')
-    if ($WhatIf) {
-        Write-Log "WHATIF: Would delete $rel"
+if ($totalSessionsFound -eq 0) {
+    Write-Log "No individual session files found in the past $LookbackDays day(s) -- nothing to consolidate."
+    Write-Log "===== Session Consolidator finished ====="
+    exit 0
+}
+
+# Combined body for Step 4 doc-update identification
+$combinedBody = $allSessionBodies -join "`n`n---`n`n"
+
+# =============================================================================
+# STEP 3b -- Upsert All-Sessions.md with a link for each newly consolidated date
+# =============================================================================
+
+$allSessionsPath = Join-Path $SessionsDir "All-Sessions.md"
+
+if (-not $WhatIf -and $consolidatedDates.Count -gt 0) {
+    $allContent = if (Test-Path -LiteralPath $allSessionsPath) {
+        Read-TextFile $allSessionsPath
     } else {
-        Remove-Item -LiteralPath $file.FullName -Force
-        Write-Log "Deleted: $rel"
+        "---`ndate: `"$Today`"`ntags: [`"sessions`", `"archive`"]`n---`n`n# All Sessions`n"
     }
+    foreach ($date in $consolidatedDates) {
+        if ($allContent -notmatch [regex]::Escape($date)) {
+            $allContent = $allContent.TrimEnd() + "`n`n## $date`n`n- [[$date]] -- Session log for $date"
+        }
+    }
+    Write-TextFile $allSessionsPath $allContent
+    Write-Log "Updated All-Sessions.md ($($consolidatedDates.Count) date(s) added)."
 }
 
 # =============================================================================
@@ -363,7 +401,7 @@ Rewrite the document incorporating this new information. Rules:
 # STEP 6 -- Toast notification
 # =============================================================================
 
-$summary = "Merged $($todayFiles.Count) session(s) into $Today.md. Updated $updated doc(s)."
+$summary = "Merged $totalSessionsFound session(s) across $($consolidatedDates.Count) date(s). Updated $updated doc(s)."
 if ($failed -gt 0) { $summary += " $failed failed." }
 Write-Log $summary
 

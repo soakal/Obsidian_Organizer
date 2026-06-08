@@ -67,7 +67,7 @@ param(
 
     [string] $Model = "anthropic/claude-haiku-4.5",
 
-    [string[]] $ExcludeFolders = @("sessions", "conversations"),
+    [string[]] $ExcludeFolders = @("sessions", "conversations", "NEXUS"),
 
     [int] $MaxNotes = 0,
 
@@ -90,6 +90,7 @@ $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LogFile     = Join-Path $ScriptDir "organizer.log"
 $ProcessedDb = Join-Path $ScriptDir "processed.json"
 $Endpoint    = "https://openrouter.ai/api/v1/chat/completions"
+$Categories  = @("Automation", "Homelab", "Projects", "Reference", "Tools", "Work")
 $Utf8NoBom   = New-Object System.Text.UTF8Encoding($false)
 
 # Log rotation: keep last 2000 lines
@@ -217,6 +218,9 @@ $candidates = foreach ($file in $allMd) {
     # Skip our own backups
     if ($file.Name -like "*.original.md") { continue }
 
+    # Skip date-named files (daily briefings, session files: YYYY-MM-DD.md or YYYY-MM-DD-*.md)
+    if ($file.Name -match '^\d{4}-\d{2}-\d{2}[-.]') { continue }
+
     # Relative path from vault root
     $rel = $file.FullName.Substring($VaultPath.Length).TrimStart('\','/')
 
@@ -246,27 +250,36 @@ $noteTitles = ($allMd |
 # ----------------------------------------------------------------------------
 $systemPrompt = @"
 You are an expert note organizer for an Obsidian vault. You receive the raw
-content of a single note (often a rambling voice-memo transcript or a
-brainstorming dump) and return a clean, rewritten version.
+content of a single note and return a clean, rewritten version.
 
 RULES:
 1. Begin the output with a YAML frontmatter block delimited by lines of exactly
    three dashes (---). It must contain a single line:
-       category: <Best-Fit Category>
-   Choose ONE concise, reusable category in Title Case that best classifies the
-   note (examples: App Ideas, Work, Security, Automation, Projects, Reference,
-   Personal). Prefer reusing an obvious existing category over inventing a new
-   one. Keep the frontmatter to just the category line. A date field will be
-   injected automatically into the frontmatter after you respond -- do NOT add a
-   date, created, updated, or any other field yourself. Output only the category
-   line inside the frontmatter.
+       category: <Category>
+   You MUST choose exactly one of these six categories, copied verbatim:
+     - Automation  : scripts, Task Scheduler jobs, CI/CD, scheduled automation, PowerShell tools
+     - Homelab     : homelab servers and infrastructure (Hermes, Unraid, NEXUS, networking, Home Assistant)
+     - Projects    : active in-progress project work and project session notes
+     - Reference   : SOPs, setup/install guides, cheat sheets, architecture docs (stable how-to material)
+     - Tools       : CLI tools and external tool documentation (codex-verify, codex CLI, openrouter, etc.)
+     - Work        : employer/job-related content (GM, Ford, BeyondTrust)
+   Apply these rules in order -- first match wins:
+     a. Homelab infrastructure, servers, or networking (Hermes, Unraid, NEXUS, Home Assistant) -> Homelab
+     b. CLI or external tool documentation -> Tools
+     c. Automation script, Task Scheduler, or CI/CD note -> Automation
+     d. Employer-related content (GM, Ford, BeyondTrust) -> Work
+     e. Stable how-to, SOP, setup guide, or reference cheat sheet -> Reference
+     f. Active in-progress project work -> Projects
+   If genuinely uncertain after applying these rules, write: category: UNSORTED
+   Do NOT add a date, created, updated, or any other field to the frontmatter.
+   Output only the category line (or UNSORTED) inside the frontmatter.
 2. Immediately AFTER the closing --- of the frontmatter, put a single line of
    inline Obsidian tags using the #tag-name form. Include:
      - the main topics/subjects of the note
      - an #app-name style tag when a specific app or project is discussed
      - a #category/<slug> tag matching the category from rule 1, where <slug>
        is the category lowercased with spaces replaced by hyphens
-       (e.g. category "App Ideas" -> #category/app-ideas)
+       (e.g. category "Homelab" -> #category/homelab)
      - #priority-brainstorm if the note is a brainstorming session
 3. Rewrite the body into clear, well-structured Markdown. Fix grammar and flow,
    use headings, lists, and short paragraphs. NEVER change the meaning, drop
@@ -472,10 +485,20 @@ foreach ($file in $candidates) {
             }
             if ([string]::IsNullOrWhiteSpace($cat)) {
                 Write-Log "FILE: no category found, leaving in place: $rel" "WARN"
+            } elseif ($cat -eq "UNSORTED") {
+                Write-Log "FILE: model returned UNSORTED, leaving in place for manual review: $rel" "WARN"
+            } elseif ($Categories -notcontains $cat) {
+                Write-Log "FILE: model returned unknown category '$cat' (not in allowlist), leaving in place: $rel" "WARN"
             } else {
-                $safeCat   = ($cat -replace '[\\/:*?"<>|]', '').Trim()
-                $targetDir = Join-Path $VaultPath $safeCat
-                if ($file.DirectoryName.TrimEnd('\') -ne $targetDir.TrimEnd('\')) {
+                $targetDir        = Join-Path $VaultPath $cat
+                $currentTopFolder = ($rel -split '[\\/]')[0]
+                $alreadyCorrect   = ($file.DirectoryName.TrimEnd('\') -eq $targetDir.TrimEnd('\'))
+
+                if ($alreadyCorrect) {
+                    Write-Log "FILE: already in correct folder ($cat), no move needed: $rel"
+                } elseif ($Categories -contains $currentTopFolder) {
+                    Write-Log "FILE: note is in managed folder '$currentTopFolder' but model assigned '$cat' -- skipping to avoid misfile: $rel" "WARN"
+                } else {
                     if (-not (Test-Path -LiteralPath $targetDir)) {
                         New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
                     }
@@ -495,7 +518,7 @@ foreach ($file in $candidates) {
                         Remove-Item -LiteralPath $file.FullName -Force
                         Write-Log "CLEANUP: removed leftover source after filing: $rel" "WARN"
                     }
-                    # Move the backup alongside if it still exists (may already be gone if -KeepBackups was not set)
+                    # Move the backup alongside if it still exists
                     if (Test-Path -LiteralPath $backupPath) {
                         $destBak = Join-Path $targetDir (Split-Path $backupPath -Leaf)
                         if (-not (Test-Path -LiteralPath $destBak)) {
@@ -505,7 +528,7 @@ foreach ($file in $candidates) {
                     # Update processed.json to the note's new relative path
                     $newRel = $destNote.Substring($VaultPath.Length).TrimStart('\','/')
                     $processed.Remove($rel) | Out-Null
-                    $processed[$newRel] = @{ status = "organized"; at = (Get-Date).ToString("o"); category = $safeCat }
+                    $processed[$newRel] = @{ status = "organized"; at = (Get-Date).ToString("o"); category = $cat }
                     Save-Processed
                     Write-Log "FILED: $rel -> $newRel"
                 }
