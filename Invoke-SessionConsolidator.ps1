@@ -77,6 +77,34 @@ function Write-TextFile {
     [System.IO.File]::WriteAllText($Path, $Content, $Utf8NoBom)
 }
 
+function Get-ConsolidatedSessions {
+    param([string] $FilePath)
+    if (-not (Test-Path -LiteralPath $FilePath)) { return @() }
+    $text = Read-TextFile $FilePath
+    if ($text -match '(?m)^consolidated_sessions:\s*(\[.*?\])') {
+        try { return @($matches[1] | ConvertFrom-Json) } catch {}
+    }
+    return @()
+}
+
+function Set-ConsolidatedSessions {
+    param([string] $FilePath, [string[]] $Sessions)
+    $text = Read-TextFile $FilePath
+    $json = "[" + (($Sessions | ForEach-Object { '"' + $_ + '"' }) -join ",") + "]"
+    if ($text -match '(?s)\A(---\r?\n)(.*?)(\r?\n---\r?\n)') {
+        $fm = $matches[2]
+        if ($fm -match '(?m)^consolidated_sessions:') {
+            $fm = ($fm -split "`r?`n" | ForEach-Object {
+                if ($_ -match '^consolidated_sessions:') { "consolidated_sessions: $json" } else { $_ }
+            }) -join "`n"
+        } else {
+            $fm = $fm.TrimEnd() + "`nconsolidated_sessions: $json"
+        }
+        $text = "---`n" + $fm + "`n---`n" + $text.Substring($matches[0].Length)
+    }
+    Write-TextFile $FilePath $text
+}
+
 # --- API call ---------------------------------------------------------------
 
 function Invoke-Claude {
@@ -158,13 +186,25 @@ for ($daysBack = 0; $daysBack -le $LookbackDays; $daysBack++) {
 
     # Per-session files: YYYY-MM-DD-SomeName.md (date-prefix + hyphen + title)
     # Bare YYYY-MM-DD.md consolidated daily files are excluded by requiring -.+
-    $dateFiles = Get-ChildItem -LiteralPath $SessionsDir -Filter "*.md" -File |
+    $allDateFiles = @(Get-ChildItem -LiteralPath $SessionsDir -Filter "*.md" -File |
         Where-Object { $_.Name -match "^$targetDate-.+\.md$" } |
-        Sort-Object Name
+        Sort-Object Name)
 
-    if ($dateFiles.Count -eq 0) { continue }
+    if ($allDateFiles.Count -eq 0) { continue }
 
-    Write-Log "Found $($dateFiles.Count) session file(s) for $targetDate."
+    $consolidatedPath = Join-Path $SessionsDir "$targetDate.md"
+    $consolidatedRel  = "sessions\$targetDate.md"
+
+    # Idempotency: filter out sessions already recorded in the daily file's frontmatter
+    $alreadyMerged = @(Get-ConsolidatedSessions -FilePath $consolidatedPath)
+    $dateFiles     = @($allDateFiles | Where-Object { $alreadyMerged -notcontains $_.Name })
+
+    if ($dateFiles.Count -eq 0) {
+        Write-Log "All $($allDateFiles.Count) session(s) for $targetDate already consolidated -- skipping."
+        continue
+    }
+
+    Write-Log "Found $($dateFiles.Count) new session file(s) for $targetDate ($($alreadyMerged.Count) already merged)."
     $totalSessionsFound += $dateFiles.Count
 
     $sessionParts = foreach ($file in $dateFiles) {
@@ -176,8 +216,8 @@ for ($daysBack = 0; $daysBack -le $LookbackDays; $daysBack++) {
     $dateCombinedBody = $sessionParts -join "`n`n---`n`n"
     $allSessionBodies.Add($dateCombinedBody)
 
-    $consolidatedPath = Join-Path $SessionsDir "$targetDate.md"
-    $consolidatedRel  = "sessions\$targetDate.md"
+    # Full merged list for writing to frontmatter
+    $mergedNames = $alreadyMerged + @($dateFiles | ForEach-Object { $_.Name })
 
     if (Test-Path -LiteralPath $consolidatedPath) {
         if ($WhatIf) {
@@ -186,13 +226,16 @@ for ($daysBack = 0; $daysBack -le $LookbackDays; $daysBack++) {
             $existing = Read-TextFile $consolidatedPath
             $appended = $existing.TrimEnd() + "`n`n---`n`n" + $dateCombinedBody
             Write-TextFile $consolidatedPath $appended
+            Set-ConsolidatedSessions -FilePath $consolidatedPath -Sessions $mergedNames
             Write-Log "Appended $($dateFiles.Count) session(s) to existing: $consolidatedRel"
         }
     } else {
+        $sessionsJson = "[" + (($mergedNames | ForEach-Object { '"' + $_ + '"' }) -join ",") + "]"
         $newContent = @"
 ---
 date: "$targetDate"
 type: "daily-session"
+consolidated_sessions: $sessionsJson
 tags: ["session", "daily-log", "category/sessions"]
 ---
 
