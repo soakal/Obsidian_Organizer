@@ -93,6 +93,12 @@ function Set-ConsolidatedSessions {
             $fm = $fm.TrimEnd() + "`nconsolidated_sessions: $json"
         }
         $text = "---`n" + $fm + "`n---`n" + $text.Substring($matches[0].Length)
+    } else {
+        # No frontmatter present: prepend a minimal block so the idempotency record
+        # is never silently lost (which would cause sessions to re-merge and content
+        # to be duplicated on the next run).
+        Write-Log "No frontmatter in ${FilePath}; prepending one to record consolidated_sessions." "WARN"
+        $text = "---`nconsolidated_sessions: $json`n---`n`n" + $text
     }
     Write-TextFile $FilePath $text
 }
@@ -107,10 +113,21 @@ function Invoke-ClaudeCode {
     $retryDelays = @(10, 30)
     $attempt = 0
     while ($true) {
-        $tmpFile = [System.IO.Path]::GetTempFileName() + ".md"
+        # Unique temp path WITHOUT GetTempFileName() (which would orphan a 0-byte
+        # .tmp file every single call, slowly filling the temp dir).
+        $tmpFile     = Join-Path ([System.IO.Path]::GetTempPath()) ("consolidator-sysprompt-{0}.md" -f ([System.Guid]::NewGuid().ToString("N")))
+        $stdErrFile  = [System.IO.Path]::GetTempFileName()
         try {
             [System.IO.File]::WriteAllText($tmpFile, $SystemMsg, $Utf8NoBom)
-            $responseJson = $Prompt | & $ClaudeExe -p --system-prompt-file $tmpFile --model $Model --output-format json 2>&1
+            # Keep stderr OUT of the JSON stream — see organizer for rationale.
+            $responseJson = $Prompt | & $ClaudeExe -p --system-prompt-file $tmpFile --model $Model --output-format json 2>$stdErrFile
+            if ($responseJson -is [array]) { $responseJson = ($responseJson -join "`n") }
+            if ([string]::IsNullOrWhiteSpace($responseJson)) {
+                $stdErr = ""
+                try { $stdErr = [System.IO.File]::ReadAllText($stdErrFile) } catch { }
+                $detail = if ($stdErr) { $stdErr.Trim() } else { "no output (exit code $LASTEXITCODE)" }
+                throw "Claude CLI produced no JSON output: $detail"
+            }
             $response = $responseJson | ConvertFrom-Json
             if ($response.is_error) { throw "Claude CLI error: $($response.result)" }
             return $response.result
@@ -124,7 +141,8 @@ function Invoke-ClaudeCode {
                 throw
             }
         } finally {
-            Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
+            Remove-Item $tmpFile    -Force -ErrorAction SilentlyContinue
+            Remove-Item $stdErrFile -Force -ErrorAction SilentlyContinue
         }
     }
 }
@@ -342,6 +360,21 @@ if ($WhatIf) {
             $parsed      = $jsonMatch.Value | ConvertFrom-Json
             $docsToUpdate = @($parsed.documents_to_update)
         }
+        # Dedupe by path (case-insensitive) so a doc named twice is not rewritten
+        # twice in one run, which would double-apply the same incorporation.
+        $seenPaths = @{}
+        $docsToUpdate = @($docsToUpdate | Where-Object {
+            $p = "$($_.path)".Trim()
+            if ([string]::IsNullOrWhiteSpace($p)) { return $false }
+            $key = $p.ToLowerInvariant()
+            if ($seenPaths.ContainsKey($key)) { return $false }
+            $seenPaths[$key] = $true
+            return $true
+        })
+        # Enforce MaxDocUpdates on our side too -- never trust the model to cap itself.
+        if ($docsToUpdate.Count -gt $MaxDocUpdates) {
+            $docsToUpdate = @($docsToUpdate | Select-Object -First $MaxDocUpdates)
+        }
         Write-Log "Claude identified $($docsToUpdate.Count) document(s) to update."
     } catch {
         Write-Log "Could not determine documents to update: $($_.Exception.Message)" "WARN"
@@ -355,10 +388,34 @@ if ($WhatIf) {
 $updated = 0
 $failed  = 0
 
+# Canonical vault root for containment checks (defends against an LLM returning
+# an absolute path or one containing ..\ that would escape the vault).
+$vaultFull = [System.IO.Path]::GetFullPath($VaultPath).TrimEnd('\', '/')
+
 foreach ($docUpdate in $docsToUpdate) {
     $docPath  = $docUpdate.path
     $whatToAdd = $docUpdate.what_to_incorporate
-    $fullPath  = Join-Path $VaultPath $docPath
+
+    if ([string]::IsNullOrWhiteSpace($docPath)) {
+        Write-Log "Skipping update with empty path." "WARN"
+        continue
+    }
+
+    $fullPath = Join-Path $VaultPath $docPath
+
+    # Resolve and verify the target stays inside the vault.
+    try { $resolvedFull = [System.IO.Path]::GetFullPath($fullPath) } catch { $resolvedFull = $null }
+    if (-not $resolvedFull -or -not ($resolvedFull.TrimEnd('\', '/') + '\').StartsWith($vaultFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-Log "Refusing update outside vault (path traversal guard): $docPath" "WARN"
+        continue
+    }
+    $fullPath = $resolvedFull
+
+    # Never rewrite our own backups or anything in the sessions folder.
+    if ($fullPath -like "*.bak" -or $fullPath -like "*.original.md") {
+        Write-Log "Refusing to rewrite backup file: $docPath" "WARN"
+        continue
+    }
 
     if (-not (Test-Path -LiteralPath $fullPath)) {
         Write-Log "Document not found, skipping: $docPath" "WARN"
@@ -412,12 +469,25 @@ Rewrite the document incorporating this new information. Rules:
 
         $backupPath = "$fullPath.bak"
         Copy-Item -LiteralPath $fullPath -Destination $backupPath -Force
-        Write-TextFile $fullPath $rewritten
+        try {
+            Write-TextFile $fullPath $rewritten
+        } catch {
+            # Write failed partway -- restore the original from the backup so we
+            # never leave a truncated/corrupt note behind.
+            if (Test-Path -LiteralPath $backupPath) {
+                Copy-Item -LiteralPath $backupPath -Destination $fullPath -Force
+                Write-Log "Restored $docPath from backup after a failed write." "WARN"
+            }
+            throw
+        }
         Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
         Write-Log "Updated: $docPath"
         $updated++
     }
     catch {
+        # Clean up any stale .bak left if the failure happened after copy.
+        $bak = "$fullPath.bak"
+        if (Test-Path -LiteralPath $bak) { Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue }
         Write-Log "ERROR updating $docPath`: $($_.Exception.Message)" "ERROR"
         $failed++
     }

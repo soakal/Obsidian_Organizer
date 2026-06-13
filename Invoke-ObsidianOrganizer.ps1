@@ -230,6 +230,9 @@ $candidates = foreach ($file in $allMd) {
     # Skip date-named files (daily briefings, session files: YYYY-MM-DD.md or YYYY-MM-DD-*.md)
     if ($file.Name -match '^\d{4}-\d{2}-\d{2}[-.]') { continue }
 
+    # Skip vault index
+    if ($file.Name -eq "_Index.md") { continue }
+
     # Relative path from vault root
     $rel = $file.FullName.Substring($VaultPath.Length).TrimStart('\','/')
 
@@ -347,8 +350,23 @@ function Invoke-ClaudeCode {
     $retryDelays = @(5, 15)
     $attempt = 0
     while ($true) {
+        # Keep stderr OUT of the JSON stream. Merging stderr into stdout (2>&1)
+        # corrupts ConvertFrom-Json the moment the CLI emits any non-JSON line
+        # (node warnings, update notices, etc.). Capture stdout only; stderr is
+        # surfaced separately if the CLI produced no parseable stdout.
+        $stdErrFile = [System.IO.Path]::GetTempFileName()
         try {
-            $responseJson = $userMessage | & $ClaudeExe -p --system-prompt-file $SystemPromptFile --model $Model --output-format json 2>&1
+            $stdErr       = $null
+            $responseJson = $userMessage | & $ClaudeExe -p --system-prompt-file $SystemPromptFile --model $Model --output-format json 2>$stdErrFile
+            try { $stdErr = [System.IO.File]::ReadAllText($stdErrFile) } catch { }
+
+            # The CLI emits a single JSON object; join in case it arrives as multiple lines.
+            if ($responseJson -is [array]) { $responseJson = ($responseJson -join "`n") }
+            if ([string]::IsNullOrWhiteSpace($responseJson)) {
+                $detail = if ($stdErr) { $stdErr.Trim() } else { "no output (exit code $LASTEXITCODE)" }
+                throw "Claude CLI produced no JSON output: $detail"
+            }
+
             $response = $responseJson | ConvertFrom-Json
             if ($response.is_error) { throw "Claude CLI error: $($response.result)" }
             return @{
@@ -364,6 +382,8 @@ function Invoke-ClaudeCode {
             } else {
                 throw
             }
+        } finally {
+            Remove-Item $stdErrFile -Force -ErrorAction SilentlyContinue
         }
     }
 }
@@ -452,7 +472,9 @@ if ($RefileOnly) {
 # ----------------------------------------------------------------------------
 # Write system prompt to temp file (reused across all notes in this run)
 # ----------------------------------------------------------------------------
-$SystemPromptFile = [System.IO.Path]::GetTempFileName() + ".md"
+# Build a unique temp path WITHOUT GetTempFileName() — that creates a 0-byte .tmp
+# file that we'd orphan when we append ".md" and write elsewhere.
+$SystemPromptFile = Join-Path ([System.IO.Path]::GetTempPath()) ("organizer-sysprompt-{0}.md" -f ([System.Guid]::NewGuid().ToString("N")))
 [System.IO.File]::WriteAllText($SystemPromptFile, $systemPrompt, $Utf8NoBom)
 
 # ----------------------------------------------------------------------------
@@ -513,6 +535,13 @@ foreach ($file in $candidates) {
         if ([string]::IsNullOrWhiteSpace($rewritten)) {
             throw "Empty rewrite returned."
         }
+
+        # Strip an accidental wrapping markdown code fence the model may add despite
+        # instructions. Without this the leading ```markdown breaks frontmatter
+        # detection, which silently defeats date/status injection and PARA filing.
+        $rewritten = $rewritten.Trim()
+        $rewritten = $rewritten -replace '(?s)\A```(?:markdown|md)?[ \t]*\r?\n', '' `
+                                 -replace '(?s)\r?\n```[ \t]*\z', ''
 
         # Determine PARA status from the category Claude assigned
         $earlyStatus = ""
