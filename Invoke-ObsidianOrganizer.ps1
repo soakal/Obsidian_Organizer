@@ -353,7 +353,7 @@ function Invoke-ClaudeCode {
             if ($response.is_error) { throw "Claude CLI error: $($response.result)" }
             return @{
                 Content = $response.result
-                CostUsd = [double]($response.cost_usd)
+                CostUsd = [double]($response.total_cost_usd)
             }
         } catch {
             if ($attempt -lt $retryDelays.Count) {
