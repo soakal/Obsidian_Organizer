@@ -37,7 +37,7 @@ $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LogFile    = Join-Path $ScriptDir "consolidator.log"
 $Utf8NoBom  = New-Object System.Text.UTF8Encoding($false)
 $Today      = (Get-Date).ToString("yyyy-MM-dd")
-$ClaudeExe  = if (Get-Command claude -ErrorAction SilentlyContinue) { "claude" } else { "C:\Users\Brian\AppData\Roaming\npm\claude.cmd" }
+$ClaudeExe  = if (Test-Path "C:\Users\Brian\AppData\Roaming\npm\claude.cmd") { "C:\Users\Brian\AppData\Roaming\npm\claude.cmd" } else { "claude" }
 
 # --- Logging ----------------------------------------------------------------
 
@@ -74,14 +74,14 @@ function Get-ConsolidatedSessions {
     if (-not (Test-Path -LiteralPath $FilePath)) { return @() }
     $text = Read-TextFile $FilePath
     if ($text -match '(?m)^consolidated_sessions:\s*(\[.*?\])') {
-        try { return @($matches[1] | ConvertFrom-Json) } catch {}
+        try { return @($matches[1] | ConvertFrom-Json) } catch { Write-Log "consolidated_sessions parse error in ${FilePath}: $($_.Exception.Message)" "WARN" }
     }
     return @()
 }
 
 function Set-ConsolidatedSessions {
     param([string] $FilePath, [string[]] $Sessions)
-    $text = Read-TextFile $FilePath
+    $text = (Read-TextFile $FilePath) -replace "`r`n", "`n"
     $json = "[" + (($Sessions | ForEach-Object { '"' + $_ + '"' }) -join ",") + "]"
     if ($text -match '(?s)\A(---\r?\n)(.*?)(\r?\n---\r?\n)') {
         $fm = $matches[2]
@@ -104,15 +104,28 @@ function Invoke-ClaudeCode {
         [string] $Prompt,
         [string] $SystemMsg = "You are a helpful assistant."
     )
-    $tmpFile = [System.IO.Path]::GetTempFileName() + ".md"
-    try {
-        [System.IO.File]::WriteAllText($tmpFile, $SystemMsg, $Utf8NoBom)
-        $responseJson = $Prompt | & $ClaudeExe -p --system-prompt-file $tmpFile --model $Model --output-format json --bare 2>&1
-        $response = $responseJson | ConvertFrom-Json
-        if ($response.is_error) { throw "Claude CLI error: $($response.result)" }
-        return $response.result
-    } finally {
-        Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
+    $retryDelays = @(10, 30)
+    $attempt = 0
+    while ($true) {
+        $tmpFile = [System.IO.Path]::GetTempFileName() + ".md"
+        try {
+            [System.IO.File]::WriteAllText($tmpFile, $SystemMsg, $Utf8NoBom)
+            $responseJson = $Prompt | & $ClaudeExe -p --system-prompt-file $tmpFile --model $Model --output-format json 2>&1
+            $response = $responseJson | ConvertFrom-Json
+            if ($response.is_error) { throw "Claude CLI error: $($response.result)" }
+            return $response.result
+        } catch {
+            if ($attempt -lt $retryDelays.Count) {
+                $delay = $retryDelays[$attempt]
+                Write-Log "Claude CLI error (attempt $($attempt + 1)): $($_.Exception.Message). Retrying in ${delay}s..." "WARN"
+                Start-Sleep -Seconds $delay
+                $attempt++
+            } else {
+                throw
+            }
+        } finally {
+            Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -227,10 +240,13 @@ $dateCombinedBody
     foreach ($file in $dateFiles) {
         $rel = $file.FullName.Substring($VaultPath.Length).TrimStart('\', '/')
         if ($WhatIf) {
-            Write-Log "WHATIF: Would delete $rel"
+            Write-Log "WHATIF: Would trash $rel"
         } else {
-            Remove-Item -LiteralPath $file.FullName -Force
-            Write-Log "Deleted: $rel"
+            $trashDir = Join-Path $VaultPath ".trash"
+            if (-not (Test-Path -LiteralPath $trashDir)) { New-Item -ItemType Directory -Path $trashDir -Force | Out-Null }
+            $trashDest = Join-Path $trashDir ($Today + "-" + $file.Name)
+            Move-Item -LiteralPath $file.FullName -Destination $trashDest
+            Write-Log "Trashed: $rel"
         }
     }
     $consolidatedDates.Add($targetDate)
@@ -394,11 +410,11 @@ Rewrite the document incorporating this new information. Rules:
             throw "Rewrite suspiciously short ($($rewritten.Length) vs $($currentContent.Length) chars) -- skipping to avoid data loss."
         }
 
-        # C3: Back up original before overwriting
         $backupPath = "$fullPath.bak"
         Copy-Item -LiteralPath $fullPath -Destination $backupPath -Force
         Write-TextFile $fullPath $rewritten
-        Write-Log "Updated: $docPath (backup: $($backupPath | Split-Path -Leaf))"
+        Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+        Write-Log "Updated: $docPath"
         $updated++
     }
     catch {

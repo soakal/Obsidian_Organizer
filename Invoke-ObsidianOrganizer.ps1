@@ -88,7 +88,7 @@ $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LogFile     = Join-Path $ScriptDir "organizer.log"
 $ProcessedDb = Join-Path $ScriptDir "processed.json"
 $Categories  = @("Automation", "Homelab", "Projects", "Reference", "Tools", "Work")
-$ClaudeExe   = if (Get-Command claude -ErrorAction SilentlyContinue) { "claude" } else { "C:\Users\Brian\AppData\Roaming\npm\claude.cmd" }
+$ClaudeExe   = if (Test-Path "C:\Users\Brian\AppData\Roaming\npm\claude.cmd") { "C:\Users\Brian\AppData\Roaming\npm\claude.cmd" } else { "claude" }
 
 # LLM semantic category -> PARA lifecycle folder
 $ParaFolderMap = @{
@@ -348,7 +348,7 @@ function Invoke-ClaudeCode {
     $attempt = 0
     while ($true) {
         try {
-            $responseJson = $userMessage | & $ClaudeExe -p --system-prompt-file $SystemPromptFile --model $Model --output-format json --bare 2>&1
+            $responseJson = $userMessage | & $ClaudeExe -p --system-prompt-file $SystemPromptFile --model $Model --output-format json 2>&1
             $response = $responseJson | ConvertFrom-Json
             if ($response.is_error) { throw "Claude CLI error: $($response.result)" }
             return @{
