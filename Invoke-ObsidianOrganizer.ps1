@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
     Organizes an Obsidian vault by sending new/un-processed notes to Claude
-    Haiku 4.5 (via the OpenRouter API) to be rewritten, tagged, flagged, and
+    Haiku 4.5 (via the Claude Code CLI) to be rewritten, tagged, flagged, and
     cross-linked. Built to run headlessly from Windows Task Scheduler.
 
 .DESCRIPTION
@@ -12,6 +12,9 @@
          append a "## Related Topics" section
       3. Writes the cleaned note back to the vault (UTF-8, no BOM)
       4. Records the note in processed.json so it is never reprocessed
+
+    Uses the Claude Code CLI (`claude -p`) for inference — no API key needed.
+    Auth is read from stored Claude Code credentials (~/.claude/).
 
     Safety features:
       * Per-note .original.md backup before any change
@@ -24,13 +27,8 @@
 .PARAMETER VaultPath
     Full path to the Obsidian vault folder (inside iCloud Drive).
 
-.PARAMETER ApiKey
-    OpenRouter API key. If omitted, the script reads (in order):
-      1. environment variable OPENROUTER_API_KEY
-      2. C:\obsidian-organizer\apikey.txt   (first non-empty line)
-
 .PARAMETER Model
-    OpenRouter model slug. Defaults to anthropic/claude-haiku-4.5.
+    Anthropic model ID. Defaults to claude-haiku-4-5-20251001.
 
 .PARAMETER ExcludeFolders
     Top-level vault subfolders to skip (auto-generated logs by default).
@@ -63,9 +61,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string] $VaultPath,
 
-    [string] $ApiKey,
-
-    [string] $Model = "anthropic/claude-haiku-4.5",
+    [string] $Model = "claude-haiku-4-5-20251001",
 
     [string[]] $ExcludeFolders = @("sessions", "conversations", "NEXUS"),
 
@@ -79,6 +75,8 @@ param(
 
     [switch] $FileIntoFolders,
 
+    [switch] $RefileOnly,
+
     [switch] $KeepBackups
 )
 
@@ -89,8 +87,29 @@ $ErrorActionPreference = "Stop"
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LogFile     = Join-Path $ScriptDir "organizer.log"
 $ProcessedDb = Join-Path $ScriptDir "processed.json"
-$Endpoint    = "https://openrouter.ai/api/v1/chat/completions"
 $Categories  = @("Automation", "Homelab", "Projects", "Reference", "Tools", "Work")
+$ClaudeExe   = if (Get-Command claude -ErrorAction SilentlyContinue) { "claude" } else { "C:\Users\Brian\AppData\Roaming\npm\claude.cmd" }
+
+# LLM semantic category -> PARA lifecycle folder
+$ParaFolderMap = @{
+    "Automation" = "20-Areas"
+    "Homelab"    = "20-Areas"
+    "Projects"   = "10-Projects"
+    "Reference"  = "30-Resources"
+    "Tools"      = "30-Resources"
+    "Work"       = "20-Areas"
+}
+# LLM semantic category -> PARA status frontmatter value
+$ParaStatusMap = @{
+    "Automation" = "active"
+    "Homelab"    = "active"
+    "Projects"   = "active"
+    "Reference"  = "evergreen"
+    "Tools"      = "evergreen"
+    "Work"       = "active"
+}
+# All PARA top-level folders this organizer manages (never re-file notes already here)
+$ParaFolders = @("00-Inbox", "10-Projects", "20-Areas", "30-Resources", "40-Archive", "MOCs")
 $Utf8NoBom   = New-Object System.Text.UTF8Encoding($false)
 
 # Log rotation: keep last 2000 lines
@@ -155,18 +174,13 @@ function Show-ToastNotification {
 }
 
 # ----------------------------------------------------------------------------
-# Resolve API key
+# Verify Claude CLI is available
 # ----------------------------------------------------------------------------
-if ([string]::IsNullOrWhiteSpace($ApiKey)) {
-    if (-not [string]::IsNullOrWhiteSpace($env:OPENROUTER_API_KEY)) {
-        $ApiKey = $env:OPENROUTER_API_KEY
-    } else {
-        $keyFile = Join-Path $ScriptDir "apikey.txt"
-        if (Test-Path $keyFile) {
-            # First non-empty, non-comment (#) line is treated as the key
-            $ApiKey = (Get-Content $keyFile | Where-Object { $_.Trim() -ne "" -and -not $_.TrimStart().StartsWith("#") } | Select-Object -First 1)
-            if ($ApiKey) { $ApiKey = $ApiKey.Trim() }
-        }
+if (-not $WhatIf) {
+    $claudeFound = (Get-Command $ClaudeExe -ErrorAction SilentlyContinue) -or (Test-Path $ClaudeExe -ErrorAction SilentlyContinue)
+    if (-not $claudeFound) {
+        Write-Log "Claude CLI not found at: $ClaudeExe — install Claude Code or fix the path." "ERROR"
+        exit 1
     }
 }
 
@@ -174,11 +188,6 @@ if ([string]::IsNullOrWhiteSpace($ApiKey)) {
 $VaultPath = $VaultPath.TrimEnd('\', '/')
 
 Write-Log "===== Obsidian Organizer run started (WhatIf=$($WhatIf.IsPresent)) ====="
-
-if ([string]::IsNullOrWhiteSpace($ApiKey) -and -not $WhatIf) {
-    Write-Log "No API key found. Set OPENROUTER_API_KEY, create apikey.txt, or pass -ApiKey." "ERROR"
-    exit 1
-}
 
 if (-not (Test-Path -LiteralPath $VaultPath)) {
     Write-Log "Vault path not found: $VaultPath" "ERROR"
@@ -293,91 +302,63 @@ RULES:
 "@
 $systemPrompt = $systemPrompt.Replace("{NOTE_TITLES}", $noteTitles)
 
-function Add-FrontmatterDate {
+function Add-FrontmatterFields {
     param(
         [string]   $Markdown,
-        [datetime] $Date
+        [datetime] $Date,
+        [string]   $Status  = "",
+        [string]   $Updated = ""
     )
 
-    $dateStr = $Date.ToString("yyyy-MM-dd")
-    $pattern = '(?s)\A(---\r?\n)(.*?)(\r?\n---\s*?(\r?\n|$))'
+    $dateStr    = $Date.ToString("yyyy-MM-dd")
+    $updatedStr = if ($Updated) { $Updated } else { (Get-Date).ToString("yyyy-MM-dd") }
+    $pattern    = '(?s)\A(---\r?\n)(.*?)(\r?\n---\s*?(\r?\n|$))'
+
+    function Set-Field([string]$body, [string]$key, [string]$val) {
+        if ($body -match "(?m)^\s*${key}:\s*.*$") {
+            return [System.Text.RegularExpressions.Regex]::Replace($body, "(?m)^\s*${key}:\s*.*$", "${key}: $val")
+        }
+        return $body.TrimEnd() + "`n${key}: $val"
+    }
 
     if ($Markdown -match $pattern) {
-        $open  = $matches[1]
-        $body  = $matches[2]
-        if ($body -match '(?m)^\s*date:\s*.*$') {
-            $newBody = [System.Text.RegularExpressions.Regex]::Replace(
-                $body, '(?m)^\s*date:\s*.*$', "date: $dateStr")
-        } else {
-            $newBody = $body.TrimEnd() + "`ndate: $dateStr"
+        $open = $matches[1]
+        $body = $matches[2]
+        $body = Set-Field $body "date"    $dateStr
+        $body = Set-Field $body "updated" $updatedStr
+        if (-not [string]::IsNullOrWhiteSpace($Status)) {
+            $body = Set-Field $body "status" $Status
         }
         $close = $matches[3]
         $rest  = $Markdown.Substring($matches[0].Length)
-        return $open + $newBody + $close + $rest
+        return $open + $body + $close + $rest
     }
 
     # No frontmatter found: prepend a minimal block
-    return "---`ndate: $dateStr`n---`n`n" + $Markdown
+    $fm = "---`ndate: $dateStr`nupdated: $updatedStr"
+    if (-not [string]::IsNullOrWhiteSpace($Status)) { $fm += "`nstatus: $Status" }
+    return $fm + "`n---`n`n" + $Markdown
 }
 
-# Cost per million tokens — OpenRouter rates for current default model; update if model changes
-$InputCostPerM  = 1.00   # claude-haiku-4.5: $1.00 / 1M input tokens
-$OutputCostPerM = 5.00   # claude-haiku-4.5: $5.00 / 1M output tokens
-
-function Invoke-Claude {
+function Invoke-ClaudeCode {
     param([string] $NoteContent)
 
-    $body = @{
-        model    = $Model
-        messages = @(
-            @{ role = "system"; content = $systemPrompt },
-            @{ role = "user";   content = "Here is the note to rewrite:`n`n$NoteContent" }
-        )
-        temperature = 0.3
-    } | ConvertTo-Json -Depth 8
-
-    $headers = @{
-        "Authorization" = "Bearer $ApiKey"
-        "Content-Type"  = "application/json"
-        "HTTP-Referer"  = "https://github.com/local/obsidian-organizer"
-        "X-Title"       = "Obsidian Organizer"
-    }
-
-    # Send body as UTF-8 bytes so non-ASCII content is preserved
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
-
+    $userMessage = "Here is the note to rewrite:`n`n$NoteContent"
     $retryDelays = @(5, 15)
     $attempt = 0
     while ($true) {
         try {
-            $resp = Invoke-RestMethod -Uri $Endpoint -Method Post -Headers $headers -Body $bytes -ContentType "application/json; charset=utf-8"
-            if (-not $resp.choices -or $resp.choices.Count -eq 0) {
-                throw "API returned no choices."
-            }
-            # Extract token usage safely — warn rather than silently record 0 if usage is absent
-            $promptTokens     = 0
-            $completionTokens = 0
-            if ($null -ne $resp.usage) {
-                $promptTokens     = [int]($resp.usage.prompt_tokens)
-                $completionTokens = [int]($resp.usage.completion_tokens)
-            } else {
-                Write-Log "API response missing usage data — token counts for this note will be 0." "WARN"
-            }
+            $responseJson = $userMessage | & $ClaudeExe -p --system-prompt-file $SystemPromptFile --model $Model --output-format json --bare 2>&1
+            $response = $responseJson | ConvertFrom-Json
+            if ($response.is_error) { throw "Claude CLI error: $($response.result)" }
             return @{
-                Content          = $resp.choices[0].message.content
-                PromptTokens     = $promptTokens
-                CompletionTokens = $completionTokens
+                Content = $response.result
+                CostUsd = [double]($response.cost_usd)
             }
         } catch {
-            # Only retry on transient errors: rate limit (429), server errors (500/502/503/529), or network failures (no status code)
-            $statusCode = 0
-            if ($null -ne $_.Exception.Response) {
-                $statusCode = [int]$_.Exception.Response.StatusCode
-            }
-            $retryable = ($statusCode -eq 0) -or ($statusCode -in @(429, 500, 502, 503, 529))
-            if ($retryable -and $attempt -lt $retryDelays.Count) {
+            if ($attempt -lt $retryDelays.Count) {
                 $delay = $retryDelays[$attempt]
-                Write-Log "API error (attempt $($attempt + 1), HTTP $statusCode): $($_.Exception.Message). Retrying in ${delay}s..." "WARN"
+                Write-Log "Claude CLI error (attempt $($attempt + 1)): $($_.Exception.Message). Retrying in ${delay}s..." "WARN"
                 Start-Sleep -Seconds $delay
                 $attempt++
             } else {
@@ -388,14 +369,99 @@ function Invoke-Claude {
 }
 
 # ----------------------------------------------------------------------------
+# -RefileOnly mode: move notes to PARA folders using existing category: frontmatter
+# No API calls — reads what Claude already assigned and maps to PARA names.
+# Run once after the PARA folder names are adopted to migrate existing notes.
+# ----------------------------------------------------------------------------
+if ($RefileOnly) {
+    Write-Log "===== RefileOnly mode: moving notes to PARA folders based on existing category: frontmatter ====="
+    $refileMoved   = 0
+    $refileSkipped = 0
+
+    foreach ($file in $allMd) {
+        if ($file.Name -like "*.original.md") { continue }
+        $rel       = $file.FullName.Substring($VaultPath.Length).TrimStart('\','/')
+        $topFolder = ($rel -split '[\\/]')[0]
+        if ($rel -match '[\\/]' -and $excludeSet.ContainsKey($topFolder.ToLowerInvariant())) { continue }
+
+        try {
+            $noteContent = Read-TextFile $file.FullName
+            $cat = $null
+            if ($noteContent -match '(?ms)^---\s*\r?\n.*?^category:\s*(.+?)\s*\r?\n.*?^---\s*$') {
+                $cat = $matches[1].Trim().Trim('"').Trim("'")
+            }
+            if ([string]::IsNullOrWhiteSpace($cat) -or $cat -eq "UNSORTED" -or $Categories -notcontains $cat) {
+                $refileSkipped++
+                continue
+            }
+
+            $paraFolder = $ParaFolderMap[$cat]
+            $targetDir  = Join-Path $VaultPath $paraFolder
+
+            if ($file.DirectoryName.TrimEnd('\') -eq $targetDir.TrimEnd('\')) {
+                Write-Log "REFILE: already in $paraFolder, skipping: $rel"
+                $refileSkipped++
+                continue
+            }
+
+            if ($WhatIf) {
+                Write-Log "REFILE WHATIF: $rel -> $paraFolder\"
+                $refileMoved++
+                continue
+            }
+
+            if (-not (Test-Path -LiteralPath $targetDir)) {
+                New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+            }
+            $destNote = Join-Path $targetDir $file.Name
+            if (Test-Path -LiteralPath $destNote) {
+                $sfx = 2
+                do {
+                    $destNote = Join-Path $targetDir ($file.BaseName + "_$sfx" + $file.Extension)
+                    $sfx++
+                } while ((Test-Path -LiteralPath $destNote) -and $sfx -le 99)
+                Write-Log "REFILE: name collision resolved, using: $(Split-Path $destNote -Leaf)" "WARN"
+            }
+            Move-Item -LiteralPath $file.FullName -Destination $destNote
+            if (Test-Path -LiteralPath $file.FullName) {
+                Remove-Item -LiteralPath $file.FullName -Force
+                Write-Log "REFILE CLEANUP: removed leftover source: $rel" "WARN"
+            }
+            # Update processed.json to the new relative path
+            $newRel = $destNote.Substring($VaultPath.Length).TrimStart('\','/')
+            if ($processed.ContainsKey($rel)) {
+                $processed.Remove($rel) | Out-Null
+                $processed[$newRel] = @{ status = "organized"; at = (Get-Date).ToString("o"); category = $cat }
+            }
+            Write-Log "REFILE: $rel -> $newRel"
+            $refileMoved++
+        } catch {
+            Write-Log "REFILE ERROR: $rel : $($_.Exception.Message)" "ERROR"
+        }
+    }
+
+    Save-Processed
+    Write-Log ("RefileOnly complete. moved={0} skipped={1}" -f $refileMoved, $refileSkipped)
+    Write-Log "===== Obsidian Organizer run finished (RefileOnly) ====="
+    if (-not $WhatIf) {
+        Show-ToastNotification -Title "Obsidian Refile complete" -Message ("Moved: {0}  Skipped: {1}" -f $refileMoved, $refileSkipped)
+    }
+    exit 0
+}
+
+# ----------------------------------------------------------------------------
+# Write system prompt to temp file (reused across all notes in this run)
+# ----------------------------------------------------------------------------
+$SystemPromptFile = [System.IO.Path]::GetTempFileName() + ".md"
+[System.IO.File]::WriteAllText($SystemPromptFile, $systemPrompt, $Utf8NoBom)
+
+# ----------------------------------------------------------------------------
 # Process notes
 # ----------------------------------------------------------------------------
 $count = 0
 $succeeded = 0
 $skipped = 0
 $failed = 0
-$totalPromptTokens = 0
-$totalCompletionTokens = 0
 $totalCostUsd = 0.0
 
 foreach ($file in $candidates) {
@@ -439,23 +505,28 @@ foreach ($file in $candidates) {
         }
 
         Write-Log "Processing: $rel"
-        $result   = Invoke-Claude -NoteContent $content
+        $result    = Invoke-ClaudeCode -NoteContent $content
         $rewritten = $result.Content
-        $totalPromptTokens     += $result.PromptTokens
-        $totalCompletionTokens += $result.CompletionTokens
-        $noteCostUsd = ($result.PromptTokens / 1000000 * $InputCostPerM) + ($result.CompletionTokens / 1000000 * $OutputCostPerM)
-        $totalCostUsd += $noteCostUsd
-        Write-Log ("TOKENS: prompt={0} completion={1} total={2} cost=`${3:F6}" -f $result.PromptTokens, $result.CompletionTokens, ($result.PromptTokens + $result.CompletionTokens), $noteCostUsd)
+        $totalCostUsd += $result.CostUsd
+        Write-Log ("COST: `${0:F6} for: {1}" -f $result.CostUsd, $rel)
 
         if ([string]::IsNullOrWhiteSpace($rewritten)) {
             throw "Empty rewrite returned."
         }
 
-        # Inject the note's original age as a date: field in the frontmatter.
+        # Determine PARA status from the category Claude assigned
+        $earlyStatus = ""
+        if ($rewritten -match '(?ms)^---\s*\r?\n.*?^category:\s*(.+?)\s*\r?\n.*?^---\s*$') {
+            $earlyCat = $matches[1].Trim().Trim('"').Trim("'")
+            if ($ParaStatusMap.ContainsKey($earlyCat)) { $earlyStatus = $ParaStatusMap[$earlyCat] }
+        }
+
+        # Inject date (original), updated (today), and status into frontmatter.
         # Capture LastWriteTime before overwriting the file.
         $originalDate = $file.LastWriteTime
-        $rewritten    = Add-FrontmatterDate -Markdown $rewritten -Date $originalDate
-        Write-Log ("DATE: injected date={0} into: {1}" -f $originalDate.ToString("yyyy-MM-dd"), $rel)
+        $todayStr     = (Get-Date).ToString("yyyy-MM-dd")
+        $rewritten    = Add-FrontmatterFields -Markdown $rewritten -Date $originalDate -Status $earlyStatus -Updated $todayStr
+        Write-Log ("DATE: injected date={0} updated={1} status={2} into: {3}" -f $originalDate.ToString("yyyy-MM-dd"), $todayStr, $earlyStatus, $rel)
 
         # Backup original (only if a backup does not already exist)
         $backupPath = Join-Path $file.DirectoryName ($file.BaseName + ".original.md")
@@ -477,7 +548,7 @@ foreach ($file in $candidates) {
             Write-Log "BACKUP DELETED: $($file.BaseName).original.md"
         }
 
-        # Optionally file the note into a folder named after its category
+        # Optionally file the note into its PARA folder (mapped from semantic category)
         if ($FileIntoFolders) {
             $cat = $null
             if ($rewritten -match '(?ms)^---\s*\r?\n.*?^category:\s*(.+?)\s*\r?\n.*?^---\s*$') {
@@ -490,14 +561,15 @@ foreach ($file in $candidates) {
             } elseif ($Categories -notcontains $cat) {
                 Write-Log "FILE: model returned unknown category '$cat' (not in allowlist), leaving in place: $rel" "WARN"
             } else {
-                $targetDir        = Join-Path $VaultPath $cat
+                $paraFolder       = $ParaFolderMap[$cat]
+                $targetDir        = Join-Path $VaultPath $paraFolder
                 $currentTopFolder = ($rel -split '[\\/]')[0]
                 $alreadyCorrect   = ($file.DirectoryName.TrimEnd('\') -eq $targetDir.TrimEnd('\'))
 
                 if ($alreadyCorrect) {
-                    Write-Log "FILE: already in correct folder ($cat), no move needed: $rel"
-                } elseif ($Categories -contains $currentTopFolder) {
-                    Write-Log "FILE: note is in managed folder '$currentTopFolder' but model assigned '$cat' -- skipping to avoid misfile: $rel" "WARN"
+                    Write-Log "FILE: already in correct PARA folder ($paraFolder), no move needed: $rel"
+                } elseif ($ParaFolders -contains $currentTopFolder) {
+                    Write-Log "FILE: note is in PARA folder '$currentTopFolder' but maps to '$paraFolder' -- skipping to avoid misfile: $rel" "WARN"
                 } else {
                     if (-not (Test-Path -LiteralPath $targetDir)) {
                         New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
@@ -543,9 +615,10 @@ foreach ($file in $candidates) {
 }
 
 Save-Processed
-Write-Log ("TOKENS TOTAL: prompt={0} completion={1} total={2} cost=`${3:F4}" -f $totalPromptTokens, $totalCompletionTokens, ($totalPromptTokens + $totalCompletionTokens), $totalCostUsd)
-Write-Log ("Run complete. processed={0} succeeded={1} skipped={2} failed={3}" -f $count, $succeeded, $skipped, $failed)
+Write-Log ("Run complete. processed={0} succeeded={1} skipped={2} failed={3} cost=`${4:F4}" -f $count, $succeeded, $skipped, $failed, $totalCostUsd)
 Write-Log "===== Obsidian Organizer run finished ====="
+
+Remove-Item $SystemPromptFile -Force -ErrorAction SilentlyContinue
 
 if (-not $WhatIf) {
     $toastTitle = "Obsidian Organizer finished"
