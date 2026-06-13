@@ -13,11 +13,8 @@
 .PARAMETER VaultPath
     Full path to the Obsidian vault folder.
 
-.PARAMETER ApiKey
-    OpenRouter API key. Reads from OPENROUTER_API_KEY env var or apikey.txt if omitted.
-
 .PARAMETER Model
-    OpenRouter model slug. Defaults to anthropic/claude-haiku-4.5.
+    Anthropic model ID. Defaults to claude-haiku-4-5-20251001.
 
 .PARAMETER MaxDocUpdates
     Maximum vault documents to update per run. Default: 5.
@@ -29,8 +26,7 @@
 [CmdletBinding()]
 param(
     [string] $VaultPath = "C:\Users\Brian\iCloudDrive\iCloud~md~obsidian\Brainstorming",
-    [string] $ApiKey,
-    [string] $Model = "anthropic/claude-haiku-4.5",
+    [string] $Model = "claude-haiku-4-5-20251001",
     [int]    $MaxDocUpdates = 5,
     [int]    $LookbackDays  = 3,
     [switch] $WhatIf
@@ -39,13 +35,9 @@ param(
 $ErrorActionPreference = "Stop"
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LogFile    = Join-Path $ScriptDir "consolidator.log"
-$Endpoint   = "https://openrouter.ai/api/v1/chat/completions"
 $Utf8NoBom  = New-Object System.Text.UTF8Encoding($false)
 $Today      = (Get-Date).ToString("yyyy-MM-dd")
-
-# C1: Force TLS 1.2 -- PS 5.1 defaults to TLS 1.0 which OpenRouter rejects
-[Net.ServicePointManager]::SecurityProtocol = `
-    [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+$ClaudeExe  = if (Get-Command claude -ErrorAction SilentlyContinue) { "claude" } else { "C:\Users\Brian\AppData\Roaming\npm\claude.cmd" }
 
 # --- Logging ----------------------------------------------------------------
 
@@ -107,58 +99,33 @@ function Set-ConsolidatedSessions {
 
 # --- API call ---------------------------------------------------------------
 
-function Invoke-Claude {
+function Invoke-ClaudeCode {
     param(
         [string] $Prompt,
         [string] $SystemMsg = "You are a helpful assistant."
     )
-    $body = @{
-        model       = $Model
-        messages    = @(
-            @{ role = "system"; content = $SystemMsg },
-            @{ role = "user";   content = $Prompt }
-        )
-        temperature = 0.2
-    } | ConvertTo-Json -Depth 8
-
-    $headers = @{
-        "Authorization" = "Bearer $ApiKey"
-        "Content-Type"  = "application/json"
-        "HTTP-Referer"  = "https://github.com/local/obsidian-consolidator"
-        "X-Title"       = "Obsidian Session Consolidator"
-    }
-
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
-    $resp  = Invoke-RestMethod -Uri $Endpoint -Method Post -Headers $headers `
-                               -Body $bytes -ContentType "application/json; charset=utf-8"
-
-    if (-not $resp.choices -or $resp.choices.Count -eq 0) {
-        throw "API returned no choices."
-    }
-    return $resp.choices[0].message.content
-}
-
-# --- Resolve API key --------------------------------------------------------
-
-if ([string]::IsNullOrWhiteSpace($ApiKey)) {
-    if (-not [string]::IsNullOrWhiteSpace($env:OPENROUTER_API_KEY)) {
-        $ApiKey = $env:OPENROUTER_API_KEY
-    } else {
-        $keyFile = Join-Path $ScriptDir "apikey.txt"
-        if (Test-Path $keyFile) {
-            $ApiKey = (Get-Content $keyFile |
-                Where-Object { $_.Trim() -ne "" -and -not $_.TrimStart().StartsWith("#") } |
-                Select-Object -First 1)
-            if ($ApiKey) { $ApiKey = $ApiKey.Trim() }
-        }
+    $tmpFile = [System.IO.Path]::GetTempFileName() + ".md"
+    try {
+        [System.IO.File]::WriteAllText($tmpFile, $SystemMsg, $Utf8NoBom)
+        $responseJson = $Prompt | & $ClaudeExe -p --system-prompt-file $tmpFile --model $Model --output-format json --bare 2>&1
+        $response = $responseJson | ConvertFrom-Json
+        if ($response.is_error) { throw "Claude CLI error: $($response.result)" }
+        return $response.result
+    } finally {
+        Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
     }
 }
+
+# --- Verify Claude CLI is available -----------------------------------------
 
 Write-Log "===== Session Consolidator started (WhatIf=$($WhatIf.IsPresent), Date=$Today) ====="
 
-if ([string]::IsNullOrWhiteSpace($ApiKey) -and -not $WhatIf) {
-    Write-Log "No API key found. Set OPENROUTER_API_KEY or create apikey.txt." "ERROR"
-    exit 1
+if (-not $WhatIf) {
+    $claudeFound = (Get-Command $ClaudeExe -ErrorAction SilentlyContinue) -or (Test-Path $ClaudeExe -ErrorAction SilentlyContinue)
+    if (-not $claudeFound) {
+        Write-Log "Claude CLI not found at: $ClaudeExe — install Claude Code or fix the path." "ERROR"
+        exit 1
+    }
 }
 
 if (-not (Test-Path -LiteralPath $VaultPath)) {
@@ -352,7 +319,7 @@ if ($WhatIf) {
     Write-Log "WHATIF: Skipping Claude identification call."
 } else {
     try {
-        $identifyRaw = Invoke-Claude -Prompt $identifyPrompt `
+        $identifyRaw = Invoke-ClaudeCode -Prompt $identifyPrompt `
             -SystemMsg "You are a knowledge base curator. Respond only with valid JSON, no extra text."
         $jsonMatch = [regex]::Match($identifyRaw, '(?s)\{.*\}')
         if ($jsonMatch.Success) {
@@ -411,7 +378,7 @@ Rewrite the document incorporating this new information. Rules:
             continue
         }
 
-        $rewritten = Invoke-Claude -Prompt $rewritePrompt `
+        $rewritten = Invoke-ClaudeCode -Prompt $rewritePrompt `
             -SystemMsg "You are a technical writer updating a knowledge base document. Output only the complete updated markdown."
 
         if ([string]::IsNullOrWhiteSpace($rewritten)) {
