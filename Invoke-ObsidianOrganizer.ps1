@@ -83,6 +83,13 @@ param(
 # ----------------------------------------------------------------------------
 # Setup
 # ----------------------------------------------------------------------------
+# Force UTF-8 for stdout/stdin when capturing output from the Claude CLI.
+# Without this, PowerShell decodes external-process output using the OEM code
+# page (CP437 on US Windows), turning UTF-8 punctuation/symbols into mojibake
+# (e.g. an em dash becomes "ΓÇö"). Must be set before any Claude CLI calls.
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
 $ErrorActionPreference = "Stop"
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LogFile     = Join-Path $ScriptDir "organizer.log"
@@ -131,7 +138,7 @@ function Write-Log {
 
 function Read-TextFile {
     param([string] $Path)
-    return [System.IO.File]::ReadAllText($Path)
+    return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
 }
 
 function Write-TextFile {
@@ -273,7 +280,7 @@ RULES:
      - Homelab     : homelab servers and infrastructure (Hermes, Unraid, NEXUS, networking, Home Assistant)
      - Projects    : active in-progress project work and project session notes
      - Reference   : SOPs, setup/install guides, cheat sheets, architecture docs (stable how-to material)
-     - Tools       : CLI tools and external tool documentation (codex-verify, codex CLI, openrouter, etc.)
+     - Tools       : CLI tools and external tool documentation (codex-verify, codex CLI, etc.)
      - Work        : employer/job-related content (GM, Ford, BeyondTrust)
    Apply these rules in order -- first match wins:
      a. Homelab infrastructure, servers, or networking (Hermes, Unraid, NEXUS, Home Assistant) -> Homelab
